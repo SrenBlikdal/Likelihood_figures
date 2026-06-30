@@ -1,0 +1,1389 @@
+---
+title: "Likelihood figures"
+author: "SrenBlikdal"
+date: "2026-06-30"
+output: html_document
+---
+
+```{r setup, include=FALSE}
+knitr::opts_chunk$set(echo = TRUE)
+```
+
+```{r}
+library(bsseq)
+library(tidyverse)
+library(rtracklayer)
+library(GenomicRanges)
+library(patchwork)
+library(gghalves)
+```
+
+# Benchmarking likelihood framework on HG002 data
+
+## Obtain publicly available HG002 ONT data  
+
+### Download data from AWS S3 bucket:
+
+```{r cars}
+summary(cars)
+```
+
+## Generate HG002 truthset for benchmarking
+
+Download HG002 vcf and bed files from GIAB truth set:
+s3://ont-open-data/giab_2023.05/analysis/benchmarking/truthset/
+
+https://42basepairs.com/browse/s3/ont-open-data/giab_2023.05/analysis/benchmarking/truthset?file=HG002_GRCh38_1_22_v4.2.1_benchmark.vcf.gz
+
+Import vcf file with with HG002 variants for GRch38 and bed files high confidence regions i.e. no inconsistent calls between different technologies.
+```{r}
+#import the vcf file
+vcf<-read_tsv(
+    "~/Documents/CpG_likelihoods/HG002_GRCh38_1_22_v4.2.1_benchmark_chr1.vcf", 
+    comment = "#", 
+    col_names = FALSE
+)
+
+colnames(vcf)<-c(
+    "ch","start","X","ref","alt","Y","Z","info", "tag", "tag_info"
+) 
+vcf$ch<-gsub("chr1","NC_000001.11",vcf$ch)
+
+# read high confidence regions and format them as GRanges
+chr1_gr <- import(
+    "~/Documents/CpG_likelihoods/HG002_GRCh38_1_22_v4.2.1_benchmark_noinconsistent_chr1.bed", 
+    format = "BED") 
+
+#change the seqnames to match the vcf file "chr1" to "NC_000001.11"
+seqlevels(chr1_gr) <- gsub("chr1","NC_000001.11", seqlevels(chr1_gr))
+```
+
+### True homozygous reference CpG sites
+
+Generate a truth set of homozygous reference CpG sites from reference CpG sites that do not overlap variants in the vcf file.
+
+```{r}
+#read the reference CpG sites and format them as GRanges
+ref_CG <- import(
+    "~/Documents/CpG_likelihoods/GCF_000001405.40_GRCh38.p14_genomic_CG_chr1.bed", 
+    format = "BED"
+) 
+ref_CG <- ref_CG[strand(ref_CG) == "+"]
+ref_CG <- subsetByOverlaps(ref_CG, chr1_gr, ignore.strand = T, type = "any")
+
+# find CpG sites that do not overlap with any variants in the vcf file
+vcf_gr<-GRanges(
+    seqnames = vcf$ch, 
+    ranges = IRanges(start = vcf$start-1, end = vcf$start+nchar(vcf$ref)+1))
+ref_hom_CG<-subsetByOverlaps(
+    ref_CG, vcf_gr, ignore.strand = T, invert = T, type = "any"
+    )
+```
+
+### Remove neighbouring variants
+
+We remove the variants where the neighboring position are also a variant as these neighboring variants can revert heterozygous CpG to homozygous CpG etc.
+
+```{r}
+vcf$next_pos <- c(vcf$start[-1], NA)
+vcf$prev_pos <- c(NA, vcf$start[-nrow(vcf)])
+
+# Identify rows with neighboring variants
+neighbor_idx <- which(
+  vcf$next_pos == vcf$start + 1 |
+  vcf$prev_pos == vcf$start - 1
+)
+
+# Remove those rows
+vcf_no_neighbours <- vcf[-neighbor_idx, ]
+```
+
+### True heterozygous reference CpG sites
+
+We generate a truth set of heterozygous reference CpG sites by finding reference CpG sites that overlap heterozygous D > G or C > H variants in the vcf file.
+
+```{r}
+# Filter heterozygous variants (0/1 or 1/0),
+# with C or G as reference and single-base ALT
+vcf_het <- vcf_no_neighbours %>%
+  filter(grepl("0/1|1/0", tag_info)) %>%
+  filter(ref == "C" | ref == "G") %>%
+  filter(nchar(alt) == 1)
+
+# Adjust start for G reference alleles
+vcf_het$start <- ifelse(
+  vcf_het$ref == "G",
+  vcf_het$start - 1,
+  vcf_het$start
+)
+
+# Create GRanges object
+vcf_het_gr <- GRanges(
+  seqnames = vcf_het$ch,
+  ranges = IRanges(
+    start = vcf_het$start,
+    end = vcf_het$start
+  )
+)
+
+# Find overlaps with reference CpG sites
+ref_het_CG <- subsetByOverlaps(
+  ref_CG,
+  vcf_het_gr,
+  ignore.strand = TRUE,
+  invert = FALSE,
+  type = "any"
+)
+```
+
+### True reference non-CpG sites
+
+Generate a truth set of non-reference CpG sites by finding reference CpG sites that overlap homozygous D > G or C > H variants in the vcf file.
+
+```{r}
+# Filter homozygous variants (1/1),
+# with C or G as reference and single-base ALT
+vcf_non <- vcf_no_neighbours %>%
+  filter(grepl("1/1", tag_info)) %>%
+  filter(ref %in% c("C", "G")) %>%
+  filter(nchar(alt) == 1)
+
+# Adjust start position for G reference alleles
+vcf_non$start <- ifelse(
+  vcf_non$ref == "G",
+  vcf_non$start - 1,
+  vcf_non$start
+)
+
+# Create GRanges object
+vcf_non_gr <- GRanges(
+  seqnames = vcf_non$ch,
+  ranges = IRanges(
+    start = vcf_non$start,
+    end = vcf_non$start
+  )
+)
+
+# Find overlaps with reference CpG sites
+ref_non_CG <- subsetByOverlaps(
+  ref_CG,
+  vcf_non_gr,
+  ignore.strand = TRUE,
+  invert = FALSE,
+  type = "any"
+)
+```
+
+### True homozygous non-reference CG loci
+
+Generate a truth set of homozygous non-reference CpG sites by finding reference CH or DG sites that overlap homozygous D > G or C > H variants in the vcf file.
+
+```{r}
+# Read reference CH/DG sites and restrict to high-confidence regions
+ref_CH <- import(
+  "~/Documents/CpG_likelihoods/GCF_000001405.40_GRCh38.p14_genomic_CH_chr1.bed",
+  format = "BED"
+)
+
+ref_CH <- subsetByOverlaps(
+  ref_CH,
+  chr1_gr,
+  ignore.strand = TRUE,
+  type = "any"
+)
+
+# Split into strands
+ref_CH_plus  <- ref_CH[strand(ref_CH) == "+"]
+ref_CH_minus <- ref_CH[strand(ref_CH) == "-"]
+
+# PLUS STRAND: Homozygous H → G
+
+vcf_hom_G <- vcf_no_neighbours %>%
+  filter(grepl("1/1", tag_info)) %>%
+  filter(ref != "G" & alt == "G") %>%
+  filter(nchar(ref) == 1 & nchar(alt) == 1)
+
+vcf_G_gr <- GRanges(
+  seqnames = vcf_hom_G$ch,
+  ranges = IRanges(
+    start = vcf_hom_G$start - 1,
+    end   = vcf_hom_G$start - 1
+  )
+)
+
+vcf_CH_G <- subsetByOverlaps(
+  ref_CH_plus,
+  vcf_G_gr,
+  ignore.strand = TRUE,
+  invert = FALSE,
+  type = "any"
+)
+
+# MINUS STRAND: Homozygous H → C
+
+vcf_hom_C <- vcf_no_neighbours %>%
+  filter(grepl("1/1", tag_info)) %>%
+  filter(ref != "C" & alt == "C") %>%
+  filter(nchar(ref) == 1 & nchar(alt) == 1)
+
+vcf_C_gr <- GRanges(
+  seqnames = vcf_hom_C$ch,
+  ranges = IRanges(
+    start = vcf_hom_C$start + 1,
+    end   = vcf_hom_C$start + 1
+  )
+)
+
+vcf_CH_C <- subsetByOverlaps(
+  ref_CH_minus,
+  vcf_C_gr,
+  ignore.strand = TRUE,
+  invert = FALSE,
+  type = "any"
+)
+
+# Shift minus strand coordinates
+vcf_CH_C <- shift(vcf_CH_C, -1)
+
+# Combine results
+ref_CH_hom <- c(vcf_CH_G, vcf_CH_C)
+```
+
+### True heterozygous non-reference CG loci
+
+Generate a truth set of heterozygous non-reference CpG sites by finding reference CH or DG sites that overlap heterozygous D > G or C > H variants in the vcf file.
+
+```{r}
+# PLUS STRAND: Heterozygous H → G
+vcf_het_G <- vcf_no_neighbours %>%
+  filter(grepl("0/1|1/0", tag_info)) %>%
+  filter(ref != "G" & alt == "G") %>%
+  filter(nchar(ref) == 1, nchar(alt) == 1)
+
+vcf_G_gr <- GRanges(
+  seqnames = vcf_het_G$ch,
+  ranges = IRanges(
+    start = vcf_het_G$start - 1,
+    end   = vcf_het_G$start - 1
+  )
+)
+
+vcf_CH_G <- subsetByOverlaps(
+  ref_CH_plus,
+  vcf_G_gr,
+  ignore.strand = TRUE,
+  invert = FALSE,
+  type = "any"
+)
+
+# MINUS STRAND: Heterozygous H → C
+vcf_het_C <- vcf_no_neighbours %>%
+  filter(grepl("0/1|1/0", tag_info)) %>%
+  filter(ref != "C" & alt == "C") %>%
+  filter(nchar(ref) == 1, nchar(alt) == 1)
+
+vcf_C_gr <- GRanges(
+  seqnames = vcf_het_C$ch,
+  ranges = IRanges(
+    start = vcf_het_C$start + 1,
+    end   = vcf_het_C$start + 1
+  )
+)
+
+vcf_CH_C <- subsetByOverlaps(
+  ref_CH_minus,
+  vcf_C_gr,
+  ignore.strand = TRUE,
+  invert = FALSE,
+  type = "any"
+)
+
+# Shift minus strand coordinates
+vcf_CH_C <- shift(vcf_CH_C, -1)
+
+# Combine results
+ref_CH_het <- c(vcf_CH_G, vcf_CH_C)
+```
+
+### True non-reference non-CpG loci
+
+Generate a truth set of non-reference non-CpG sites by finding reference CH or DG sites that do not overlap with any variants in the vcf file.
+
+```{r}
+# Create GRanges object for all variants
+vcf_gr <- GRanges(
+  seqnames = vcf$ch,
+  ranges = IRanges(
+    start = vcf$start - 1,
+    end   = vcf$start + nchar(vcf$ref) + 1
+  )
+)
+
+# Find CH sites that do NOT overlap any variants
+ref_CH_non <- subsetByOverlaps(
+  ref_CH,
+  vcf_gr,
+  ignore.strand = TRUE,
+  invert = TRUE,
+  type = "any"
+)
+```
+
+### Benmark data 
+To benchmark the likelihood framework we have a truth set of 2.083.686 homozygous CpG loci, 26.352 heterozygous CpG loci and 14.805 non-CpG loci in the sample, which are all CpG loci in the reference genome. We also have a truth set of 16.891 homozygous CpG loci and 22.288 heterozygous CpG loci, and 84.991.174 non-CpG loci (CH/DG) in the sample, which are non-CpG loci in the reference genome.
+
+```{r}
+benchmark_data <- tibble(
+  reference_CG = c("yes", "yes", "yes", "no", "no", "no"),
+  type = c(
+    "homozygous", "heterozygous", "non-CpG",
+    "homozygous", "heterozygous", "non-CpG"
+  ),
+  n = c(
+    length(ref_hom_CG),
+    length(ref_het_CG),
+    length(ref_non_CG),
+    length(ref_CH_hom),
+    length(ref_CH_het),
+    length(ref_CH_non)
+  )
+)
+
+benchmark_data
+```
+
+## Benchmarking
+### Helper function to count overlaps between query and target GRanges objects
+
+```{r}
+# Helper: count overlaps
+
+count_overlaps <- function(query_gr, targets) {
+  c(
+    length(subsetByOverlaps(query_gr, targets$ref_hom_CG, ignore.strand = TRUE)),
+    length(subsetByOverlaps(query_gr, targets$ref_het_CG, ignore.strand = TRUE)),
+    length(subsetByOverlaps(query_gr, targets$ref_non_CG, ignore.strand = TRUE)),
+    length(subsetByOverlaps(query_gr, targets$ref_CH_hom, ignore.strand = TRUE)),
+    length(subsetByOverlaps(query_gr, targets$ref_CH_het, ignore.strand = TRUE)),
+    length(subsetByOverlaps(query_gr, targets$ref_CH_non, ignore.strand = TRUE))
+  )
+}
+```
+
+## Nanopore
+### Read Nanopore data and build confusion matrix
+
+```{r}
+files <- list.files(
+  "~/Documents/CpG_likelihoods/bedMethyls",
+  pattern = "modkit",
+  full.names = TRUE
+)
+
+mc <- read.bedMethyl(
+  files[2],
+  strandCollapse = TRUE,
+  verbose = TRUE,
+  output = "MethylCounts"
+)
+
+# Define truth sets (for cleaner calls)
+targets <- list(
+  ref_hom_CG = ref_hom_CG,
+  ref_het_CG = ref_het_CG,
+  ref_non_CG = ref_non_CG,
+  ref_CH_hom = ref_CH_hom,
+  ref_CH_het = ref_CH_het,
+  ref_CH_non = ref_CH_non
+)
+
+# Build confusion matrix
+
+# Total (truth)
+tot <- sapply(targets, length)
+
+# Different call types
+raw <- count_overlaps(granges(mc), targets)
+
+all <- count_overlaps(
+  granges(mc[getCpGs(mc, type = "allCpG"), ]),
+  targets
+)
+
+hom <- count_overlaps(
+  granges(mc[getCpGs(mc, type = "homozygous"), ]),
+  targets
+)
+
+het <- count_overlaps(
+  granges(mc[getCpGs(mc, type = "heterozygous"), ]),
+  targets
+)
+
+# Combine into matrix
+conf_mat <- rbind(tot, raw, all, hom, het)
+
+rownames(conf_mat) <- c(
+  "benchmark loci",
+  "unfiltered",
+  "allCpG",
+  "homozygous",
+  "heterozygous"
+)
+
+colnames(conf_mat) <- c(
+  "ref_homozygous",
+  "ref_heterozygous",
+  "ref_non-CpG",
+  "homozygous",
+  "heterozygous",
+  "non-CpG"
+)
+```
+
+### Plot Nanopore confussion matrix with unfiltered results included  
+
+```{r}
+# Prepare data for plotting
+
+# Convert counts to frequencies
+conf_mat_freq <- sweep(conf_mat[2:5, ], 2, conf_mat[1, ], "/")
+
+# Convert to tidy format
+conf_mat_freq_tbl <- as_tibble(conf_mat_freq, rownames = "Call") %>%
+  pivot_longer(-Call, names_to = "Truth", values_to = "freq")
+
+conf_mat_count_tbl <- as_tibble(conf_mat, rownames = "Call") %>%
+  pivot_longer(-Call, names_to = "Truth", values_to = "n")
+
+# Combine counts + frequencies
+conf_mat_plot <- left_join(
+  conf_mat_count_tbl,
+  conf_mat_freq_tbl,
+  by = c("Truth", "Call")
+)
+
+# Adjust frequencies for non-CpG classes (invert)
+conf_mat_plot <- conf_mat_plot %>%
+  mutate(
+    freq = ifelse(
+      Truth %in% c("ref_non-CpG", "non-CpG"),
+      1 - freq,
+      freq
+    )
+  )
+
+# Set factor order
+truth_levels <- c(
+  "ref_homozygous",
+  "ref_heterozygous",
+  "ref_non-CpG",
+  "homozygous",
+  "heterozygous",
+  "non-CpG"
+)
+
+call_levels <- c(
+  "benchmark loci",
+  "unfiltered",
+  "allCpG",
+  "homozygous",
+  "heterozygous"
+)
+
+conf_mat_plot$Call  <- factor(conf_mat_plot$Call, levels = rev(call_levels))
+conf_mat_plot$Truth <- factor(conf_mat_plot$Truth, levels = truth_levels)
+
+# Plot heatmap
+ggplot(conf_mat_plot, aes(x = Truth, y = Call, fill = freq)) +
+  geom_tile() +
+  geom_text(
+    aes(
+      label = n,
+      color = ifelse(
+        is.na(freq),
+        "white",
+        ifelse(freq < 0.5, "black", "white")
+      )
+    )
+  ) +
+  scale_color_identity() +
+  scale_fill_gradientn(
+    colors = RColorBrewer::brewer.pal(9, "Reds"),
+    limits = c(0, 1)
+  ) +
+  scale_x_discrete(labels = function(x) gsub("^ref_", "", x)) +
+  theme_minimal() +
+  geom_vline(xintercept = 3.5, color = "white", size = 2) +
+  geom_hline(yintercept = 3.5, color = "white", size = 1) +
+  geom_hline(yintercept = 4.5, color = "white", size = 1) +
+  labs(
+    title = "",
+    x = "True CpG status",
+    y = "Called CpG status"
+  ) +
+  theme(
+    plot.title = element_text(size = 14, face = "bold"),
+    axis.title.x = element_text(size = 14),
+    axis.title.y = element_text(size = 14),
+    axis.text.x = element_text(size = 12),
+    axis.text.y = element_text(size = 12, angle = 55, hjust = 1),
+    legend.position = "bottom",
+    legend.key.height = unit(1.2, "cm"),
+    legend.key.width  = unit(2.5, "cm"),
+    legend.title = element_text(size = 14),
+    legend.text  = element_text(size = 12)
+  )
+```
+
+### Full table with sensitivity, and precision for Nanopore 
+
+```{r}
+# Sensitivity matrix
+sens_mat <- sweep(conf_mat[2:5, ], 2, conf_mat[1, ], "/")
+
+# Invert non-CpG classes
+sens_mat[, c("ref_non-CpG", "non-CpG")] <-
+  1 - sens_mat[, c("ref_non-CpG", "non-CpG")]
+
+# Prepare matrix
+conf_sub <- conf_mat[2:5, ]
+ref_total    <- conf_sub[, 1] + conf_sub[, 2] + conf_sub[, 3]
+nonref_total <- conf_sub[, 4] + conf_sub[, 5] + conf_sub[, 6]
+row_total    <- rowSums(conf_sub)
+
+
+# PPV calculations
+ppv_ref <- c(
+  (conf_sub["unfiltered", 1] + conf_sub["unfiltered", 2]) / ref_total["unfiltered"],
+  (conf_sub["allCpG", 1]     + conf_sub["allCpG", 2])     / ref_total["allCpG"],
+  conf_sub["homozygous", 1]  / ref_total["homozygous"],
+  conf_sub["heterozygous", 2] / ref_total["heterozygous"]
+)
+
+ppv_nonref <- c(
+  (conf_sub["unfiltered", 4] + conf_sub["unfiltered", 5]) / nonref_total["unfiltered"],
+  (conf_sub["allCpG", 4]     + conf_sub["allCpG", 5])     / nonref_total["allCpG"],
+  conf_sub["homozygous", 4]  / nonref_total["homozygous"],
+  conf_sub["heterozygous", 5] / nonref_total["heterozygous"]
+)
+
+ppv_combined <- c(
+  (conf_sub["unfiltered", 1] + conf_sub["unfiltered", 2] +
+   conf_sub["unfiltered", 4] + conf_sub["unfiltered", 5]) / row_total["unfiltered"],
+
+  (conf_sub["allCpG", 1] + conf_sub["allCpG", 2] +
+   conf_sub["allCpG", 4] + conf_sub["allCpG", 5]) / row_total["allCpG"],
+
+  (conf_sub["homozygous", 1] + conf_sub["homozygous", 4]) /
+    row_total["homozygous"],
+
+  (conf_sub["heterozygous", 2] + conf_sub["heterozygous", 5]) /
+    row_total["heterozygous"]
+)
+
+# Final table
+final_table <- as.data.frame(sens_mat) %>%
+  rownames_to_column("Call") %>%
+  mutate(
+    ppv_ref = ppv_ref,
+    ppv_nonref = ppv_nonref,
+    ppv_combined = ppv_combined
+  )
+
+# Rename columns (short + consistent)
+final_table <- final_table %>%
+  rename(
+    ref_hom = ref_homozygous,
+    ref_het = ref_heterozygous,
+    ref_nonCpG = `ref_non-CpG`,
+    nonref_hom = homozygous,
+    nonref_het = heterozygous,
+    nonref_nonCpG = `non-CpG`
+  )
+
+# Format numbers
+final_table_fmt <- final_table %>%
+  mutate(across(-Call, ~ sprintf("%.5f", .)))
+
+# Write output
+write.table(
+  final_table_fmt,
+  sep = "\t",
+  row.names = FALSE,
+  quote = FALSE
+)
+```
+
+## PacBio
+### Read PacBio data and build confusion matrix
+
+```{r}
+files <- list.files(
+  "~/Documents/CpG_likelihoods/bedMethyls",
+  pattern = "modkit",
+  full.names = TRUE
+)
+
+mc <- read.bedMethyl(
+  files[3],
+  strandCollapse = TRUE,
+  verbose = TRUE,
+  output = "MethylCounts"
+)
+
+# Define truth sets (for cleaner calls)
+targets <- list(
+  ref_hom_CG = ref_hom_CG,
+  ref_het_CG = ref_het_CG,
+  ref_non_CG = ref_non_CG,
+  ref_CH_hom = ref_CH_hom,
+  ref_CH_het = ref_CH_het,
+  ref_CH_non = ref_CH_non
+)
+
+# Build confusion matrix
+
+# Total (truth)
+tot <- sapply(targets, length)
+
+# Different call types
+raw <- count_overlaps(granges(mc), targets)
+
+all <- count_overlaps(
+  granges(mc[getCpGs(mc, type = "allCpG"), ]),
+  targets
+)
+
+hom <- count_overlaps(
+  granges(mc[getCpGs(mc, type = "homozygous"), ]),
+  targets
+)
+
+het <- count_overlaps(
+  granges(mc[getCpGs(mc, type = "heterozygous"), ]),
+  targets
+)
+
+# Combine into matrix
+conf_mat <- rbind(tot, raw, all, hom, het)
+
+rownames(conf_mat) <- c(
+  "benchmark loci",
+  "unfiltered",
+  "allCpG",
+  "homozygous",
+  "heterozygous"
+)
+
+colnames(conf_mat) <- c(
+  "ref_homozygous",
+  "ref_heterozygous",
+  "ref_non-CpG",
+  "homozygous",
+  "heterozygous",
+  "non-CpG"
+)
+```
+
+### Plot PacBio confussion matrix with unfiltered results included  
+
+```{r}
+# Prepare data for plotting
+
+# Convert counts to frequencies
+conf_mat_freq <- sweep(conf_mat[2:5, ], 2, conf_mat[1, ], "/")
+
+# Convert to tidy format
+conf_mat_freq_tbl <- as_tibble(conf_mat_freq, rownames = "Call") %>%
+  pivot_longer(-Call, names_to = "Truth", values_to = "freq")
+
+conf_mat_count_tbl <- as_tibble(conf_mat, rownames = "Call") %>%
+  pivot_longer(-Call, names_to = "Truth", values_to = "n")
+
+# Combine counts + frequencies
+conf_mat_plot <- left_join(
+  conf_mat_count_tbl,
+  conf_mat_freq_tbl,
+  by = c("Truth", "Call")
+)
+
+# Adjust frequencies for non-CpG classes (invert)
+conf_mat_plot <- conf_mat_plot %>%
+  mutate(
+    freq = ifelse(
+      Truth %in% c("ref_non-CpG", "non-CpG"),
+      1 - freq,
+      freq
+    )
+  )
+
+# Set factor order
+truth_levels <- c(
+  "ref_homozygous",
+  "ref_heterozygous",
+  "ref_non-CpG",
+  "homozygous",
+  "heterozygous",
+  "non-CpG"
+)
+
+call_levels <- c(
+  "benchmark loci",
+  "unfiltered",
+  "allCpG",
+  "homozygous",
+  "heterozygous"
+)
+
+conf_mat_plot$Call  <- factor(conf_mat_plot$Call, levels = rev(call_levels))
+conf_mat_plot$Truth <- factor(conf_mat_plot$Truth, levels = truth_levels)
+
+# Plot heatmap
+ggplot(conf_mat_plot, aes(x = Truth, y = Call, fill = freq)) +
+  geom_tile() +
+  geom_text(
+    aes(
+      label = n,
+      color = ifelse(
+        is.na(freq),
+        "white",
+        ifelse(freq < 0.5, "black", "white")
+      )
+    )
+  ) +
+  scale_color_identity() +
+  scale_fill_gradientn(
+    colors = RColorBrewer::brewer.pal(9, "Reds"),
+    limits = c(0, 1)
+  ) +
+  scale_x_discrete(labels = function(x) gsub("^ref_", "", x)) +
+  theme_minimal() +
+  geom_vline(xintercept = 3.5, color = "white", size = 2) +
+  geom_hline(yintercept = 3.5, color = "white", size = 1) +
+  geom_hline(yintercept = 4.5, color = "white", size = 1) +
+  labs(
+    title = "",
+    x = "True CpG status",
+    y = "Called CpG status"
+  ) +
+  theme(
+    plot.title = element_text(size = 14, face = "bold"),
+    axis.title.x = element_text(size = 14),
+    axis.title.y = element_text(size = 14),
+    axis.text.x = element_text(size = 12),
+    axis.text.y = element_text(size = 12, angle = 55, hjust = 1),
+    legend.position = "bottom",
+    legend.key.height = unit(1.2, "cm"),
+    legend.key.width  = unit(2.5, "cm"),
+    legend.title = element_text(size = 14),
+    legend.text  = element_text(size = 12)
+  )
+```
+
+### Full table with sensitivity, and precision for PacBio
+
+```{r}
+# Sensitivity matrix
+sens_mat <- sweep(conf_mat[2:5, ], 2, conf_mat[1, ], "/")
+
+# Invert non-CpG classes
+sens_mat[, c("ref_non-CpG", "non-CpG")] <-
+  1 - sens_mat[, c("ref_non-CpG", "non-CpG")]
+
+# Prepare matrix
+conf_sub <- conf_mat[2:5, ]
+ref_total    <- conf_sub[, 1] + conf_sub[, 2] + conf_sub[, 3]
+nonref_total <- conf_sub[, 4] + conf_sub[, 5] + conf_sub[, 6]
+row_total    <- rowSums(conf_sub)
+
+
+# PPV calculations
+ppv_ref <- c(
+  (conf_sub["unfiltered", 1] + conf_sub["unfiltered", 2]) / ref_total["unfiltered"],
+  (conf_sub["allCpG", 1]     + conf_sub["allCpG", 2])     / ref_total["allCpG"],
+  conf_sub["homozygous", 1]  / ref_total["homozygous"],
+  conf_sub["heterozygous", 2] / ref_total["heterozygous"]
+)
+
+ppv_nonref <- c(
+  (conf_sub["unfiltered", 4] + conf_sub["unfiltered", 5]) / nonref_total["unfiltered"],
+  (conf_sub["allCpG", 4]     + conf_sub["allCpG", 5])     / nonref_total["allCpG"],
+  conf_sub["homozygous", 4]  / nonref_total["homozygous"],
+  conf_sub["heterozygous", 5] / nonref_total["heterozygous"]
+)
+
+ppv_combined <- c(
+  (conf_sub["unfiltered", 1] + conf_sub["unfiltered", 2] +
+   conf_sub["unfiltered", 4] + conf_sub["unfiltered", 5]) / row_total["unfiltered"],
+
+  (conf_sub["allCpG", 1] + conf_sub["allCpG", 2] +
+   conf_sub["allCpG", 4] + conf_sub["allCpG", 5]) / row_total["allCpG"],
+
+  (conf_sub["homozygous", 1] + conf_sub["homozygous", 4]) /
+    row_total["homozygous"],
+
+  (conf_sub["heterozygous", 2] + conf_sub["heterozygous", 5]) /
+    row_total["heterozygous"]
+)
+
+# Final table
+final_table <- as.data.frame(sens_mat) %>%
+  rownames_to_column("Call") %>%
+  mutate(
+    ppv_ref = ppv_ref,
+    ppv_nonref = ppv_nonref,
+    ppv_combined = ppv_combined
+  )
+
+# Rename columns (short + consistent)
+final_table <- final_table %>%
+  rename(
+    ref_hom = ref_homozygous,
+    ref_het = ref_heterozygous,
+    ref_nonCpG = `ref_non-CpG`,
+    nonref_hom = homozygous,
+    nonref_het = heterozygous,
+    nonref_nonCpG = `non-CpG`
+  )
+
+# Format numbers
+final_table_fmt <- final_table %>%
+  mutate(across(-Call, ~ sprintf("%.5f", .)))
+
+# Write output
+write.table(
+  final_table_fmt,
+  sep = "\t",
+  row.names = FALSE,
+  quote = FALSE
+)
+```
+
+## Modification levels for reference and non-reference CpGs 
+### Define plot function
+
+```{r}
+make_mod_plot <- function(mc, ref_set, nonref_set) {
+  
+  # Subset data
+  mc_ref <- subsetByOverlaps(mc, ref_set, ignore.strand = TRUE, type = "any")
+  mc_nonref <- subsetByOverlaps(mc, nonref_set, ignore.strand = TRUE, type = "any")
+  
+  # Compute modification levels
+  ref_mod <- (getMethylCounts(mc_ref, type="M") +
+              getMethylCounts(mc_ref, type="H")) /
+              getMethylCounts(mc_ref, type="Cov")
+  
+  nonref_mod <- (getMethylCounts(mc_nonref, type="M") +
+                 getMethylCounts(mc_nonref, type="H")) /
+                 getMethylCounts(mc_nonref, type="Cov")
+  
+  # KS test
+  ks_res <- ks.test(ref_mod, nonref_mod)
+  
+  ks_label <- sprintf("KS = %.3f\np = %.1e",
+                      ks_res$statistic,
+                      ks_res$p.value)
+  
+  # Build dataframe
+  mod_df <- data.frame(
+    mod = c(ref_mod, nonref_mod),
+    type = c(rep("reference", length(ref_mod)),
+             rep("non-reference", length(nonref_mod)))
+  )
+  
+  # Summary stats
+  summary_stats <- mod_df %>%
+    group_by(type) %>%
+    summarise(mean_val = mean(mod, na.rm = TRUE), .groups = "drop")
+  
+  # Plot
+  ggplot() +
+    geom_half_violin(
+      data = filter(mod_df, type == "reference"),
+      aes(y = mod, fill = type),
+      adjust = 3,
+      side = "l",
+      position = position_nudge(x = -0.005)
+    ) +
+    geom_half_violin(
+      data = filter(mod_df, type == "non-reference"),
+      aes(y = mod, fill = type),
+      adjust = 3,
+      side = "r",
+      position = position_nudge(x = 0.005)
+    ) +
+    geom_segment(
+      data = filter(summary_stats, type == "reference"),
+      aes(x = -0.3, xend = -0.005, y = mean_val, yend = mean_val),
+      size = 1
+    ) +
+    geom_segment(
+      data = filter(summary_stats, type == "non-reference"),
+      aes(x = 0.005, xend = 0.3, y = mean_val, yend = mean_val),
+      size = 1
+    ) +
+    annotate(
+      "text",
+      x = 0.38,
+      y = min(mod_df$mod, na.rm = TRUE) + 
+          0.05 * (max(mod_df$mod, na.rm = TRUE) - min(mod_df$mod, na.rm = TRUE)),
+      label = ks_label,
+      hjust = 1,
+      vjust = 0,
+      size = 4
+    ) +
+    scale_fill_manual(values = c("reference" = "darkgrey",
+                                 "non-reference" = "lightgrey")) +
+    theme_bw() +
+    theme(
+      axis.title.y = element_blank()
+    )
+}
+```
+
+### Nanopore methylation plot
+```{r}
+files <- list.files(
+  "~/Documents/CpG_likelihoods/bedMethyls",
+  pattern = "modkit",
+  full.names = TRUE
+)
+
+mc_nano <- read.bedMethyl(
+  files[2],
+  strandCollapse = TRUE,
+  verbose = TRUE,
+  output = "MethylCounts"
+)
+
+p1 <- make_mod_plot(
+  mc_nano[getCpGs(mc_nano, type = "homozygous"), ],
+  ref_hom_CG,
+  ref_CH_hom
+)
+
+p2 <- make_mod_plot(
+  mc_nano[getCpGs(mc_nano, type = "heterozygous"), ],
+  ref_het_CG,
+  ref_CH_het
+)
+
+p3 <- make_mod_plot(
+  mc_nano[getCpGs(mc_nano, type = "allCpG"), ],
+  c(ref_hom_CG, ref_het_CG),
+  c(ref_CH_hom, ref_CH_het)
+)
+```
+
+### PacBio methylation plot
+```{r}
+files <- list.files(
+  "~/Documents/CpG_likelihoods/bedMethyls",
+  pattern = "modkit",
+  full.names = TRUE
+)
+
+mc_pac <- read.bedMethyl(
+  files[2],
+  strandCollapse = TRUE,
+  verbose = TRUE,
+  output = "MethylCounts"
+)
+
+p4 <- make_mod_plot(
+  mc_pac[getCpGs(mc_pac, type = "homozygous"), ],
+  ref_hom_CG,
+  ref_CH_hom
+)
+
+p5 <- make_mod_plot(
+  mc_pac[getCpGs(mc_pac, type = "heterozygous"), ],
+  ref_het_CG,
+  ref_CH_het
+)
+
+p6 <- make_mod_plot(
+  mc_pac[getCpGs(mc_pac, type = "allCpG"), ],
+  c(ref_hom_CG, ref_het_CG),
+  c(ref_CH_hom, ref_CH_het)
+)
+```
+
+### Final plot
+```{r}
+p1 <- p1 + labs(x = "")
+p2 <- p2 + labs(x = "")
+p3 <- p3 + labs(x = "")
+p4 <- p4 + labs(x = "homozygous")
+p5 <- p5 + labs(x = "heterozygous")
+p6 <- p6 + labs(x = "allCpG")
+
+combined_plot <- c(p1, p2, p3, p4, p5, p6) %>%
+  wrap_plots(nrow = 2) +
+  plot_layout(guides = "collect") &
+  theme(
+    plot.title = element_text(size = 16, face = "bold", hjust = 0.5),
+    axis.text.x = element_text(size = 15),
+    axis.text.y = element_text(size = 15),
+    axis.title.x = element_text(size = 15),
+    legend.position = "bottom",
+    legend.key.size = unit(0.8, "cm"),
+    legend.text = element_text(size = 15),
+    legend.title = element_text(size = 15)
+  )
+#export pdf 10x10
+```
+
+
+# Silversides validation
+
+### Read data 
+```{r}
+files <- list.files(
+  "~/Desktop/BSseq_long-read/data/silversides_chr24/modkit",
+  full.names = TRUE
+)
+
+mc_raw <- read.bedMethyl(
+  files,
+  strandCollapse = TRUE,
+  verbose = TRUE,
+  output = "MethylCounts"
+)
+
+G_all<-getCpGMatrix(mc_raw, allCpG = T)
+Q_all<-getMaxLikelihoodMatrix(mc_raw, allCpG = T)
+
+loci.idx <- which(
+  DelayedMatrixStats::rowSums2(Q_all >= .99 & G_all==0) >= 2)
+mc<-mc_raw[loci.idx]
+```
+
+### read reference CG loci and convert to GRanges 
+```{r}
+# Read reference CpG sites and filter chromosome + strand
+ref_CG <- read_tsv(
+  "~/Documents/Silversides/Mmenidia_refgenome_anchored.all_renamed_v2_CG.bed",
+  col_names = c("seqnames", "start", "end", "X", "Y", "strand")
+) %>%
+  filter(seqnames == "Mme_chr24", strand == "+")
+
+# Add zero-based positions (needed downstream)
+ref_CG$start_zerobased <- ref_CG$start
+ref_CG$end_zerobased   <- ref_CG$start
+
+# Convert to GRanges
+ref_CG_gr <- GRanges(
+  seqnames = ref_CG$seqnames,
+  ranges = IRanges(
+    start = ref_CG$start,
+    end   = ref_CG$end
+  )
+)
+```
+
+### Prepare functions and data for plotting
+```{r}
+# Count coverage ≥1 per column
+count_coverage <- function(mc_obj) {
+  sapply(1:9, function(i) {
+    sum(getMethylCounts(mc_obj[, i], type = "Cov") >= 1)
+  })
+}
+
+# Count overlaps for a given CpG type
+count_overlaps_mc <- function(mc_obj, cpg_type, ref_gr, invert = FALSE) {
+  sapply(1:9, function(i) {
+    gr <- granges(mc_obj[, i][getCpGs(mc_obj[, i], type = cpg_type), ])
+    length(
+      subsetByOverlaps(
+        gr,
+        ref_gr,
+        ignore.strand = TRUE,
+        type = "any",
+        invert = invert
+      )
+    )
+  })
+}
+```
+
+```{r}
+# Coverage
+unfiltered <- count_coverage(mc_raw)
+
+# Reference CpG
+all_ref <- count_overlaps_mc(mc, "allCpG", ref_CG_gr)
+hom_ref <- count_overlaps_mc(mc, "homozygous", ref_CG_gr)
+het_ref <- count_overlaps_mc(mc, "heterozygous", ref_CG_gr)
+
+# Non-reference CpG
+all_nonref <- count_overlaps_mc(mc, "allCpG", ref_CG_gr, invert = TRUE)
+hom_nonref <- count_overlaps_mc(mc, "homozygous", ref_CG_gr, invert = TRUE)
+het_nonref <- count_overlaps_mc(mc, "heterozygous", ref_CG_gr, invert = TRUE)
+```
+
+```{r}
+mat <- matrix(
+  c(
+    unfiltered,
+    hom_ref, het_ref, all_ref,
+    hom_nonref, het_nonref, all_nonref
+  ),
+  ncol = 7,
+  byrow = FALSE
+)
+
+rownames(mat) <- c("AA1","AA2","AA3","RA1","RA2","RA3","RR1","RR2","RR3")
+
+colnames(mat) <- c(
+  "unfiltered",
+  "ref_homozygous",
+  "ref_heterozygous",
+  "ref_allCpG",
+  "homozygous",
+  "heterozygous",
+  "allCpG"
+)
+
+mat
+```
+
+### Plot Silversides data with counts and frequencies
+```{r}
+# Convert matrix to long format
+mat_tbl <- as_tibble(mat, rownames = "sample") %>%
+  pivot_longer(-sample, names_to = "Call", values_to = "n")
+
+# Compute frequencies
+mat_freq <- cbind(
+  ref_homozygous   = mat[, 1] / (mat[, 1] + mat[, 4]),
+  ref_heterozygous = mat[, 2] / (mat[, 2] + mat[, 5]),
+  ref_allCpG       = mat[, 3] / (mat[, 3] + mat[, 6]),
+  homozygous       = mat[, 4] / (mat[, 1] + mat[, 4]),
+  heterozygous     = mat[, 5] / (mat[, 2] + mat[, 5]),
+  allCpG           = mat[, 6] / (mat[, 3] + mat[, 6])
+)
+
+rownames(mat_freq) <- rownames(mat)
+colnames(mat_freq) <- c(
+  "ref_homozygous",
+  "ref_heterozygous",
+  "ref_allCpG",
+  "homozygous",
+  "heterozygous",
+  "allCpG"
+)
+
+mat_freq_tbl <- as_tibble(mat_freq, rownames = "sample") %>%
+  pivot_longer(-sample, names_to = "Call", values_to = "freq")
+
+# Combine counts + frequencies
+mat_plot <- left_join(mat_tbl, mat_freq_tbl, by = c("sample", "Call"))
+
+# Remove frequency for unfiltered
+mat_plot$freq[mat_plot$Call == "unfiltered"] <- NA
+
+# Factor ordering
+call_levels <- c(
+  "unfiltered",
+  "ref_homozygous", "ref_heterozygous", "ref_allCpG",
+  "homozygous", "heterozygous", "allCpG"
+)
+
+sample_levels <- rev(c(
+  "RR1", "RR2", "RR3",
+  "RA1", "RA2", "RA3",
+  "AA1", "AA2", "AA3"
+))
+
+mat_plot$Call   <- factor(mat_plot$Call, levels = call_levels)
+mat_plot$sample <- factor(mat_plot$sample, levels = sample_levels)
+
+# Plot
+ggplot(mat_plot, aes(x = Call, y = sample, fill = freq)) +
+  geom_tile() +
+  geom_text(
+    aes(
+      label = n,
+      color = ifelse(is.na(freq) | freq < 0.5, "black", "white")
+    )
+  ) +
+  scale_color_identity() +
+  scale_fill_gradientn(
+    colors = RColorBrewer::brewer.pal(9, "Blues"),
+    limits = c(0, 1),
+    na.value = "grey"
+  ) +
+  scale_x_discrete(labels = function(x) gsub("^ref_", "", x)) +
+  theme_minimal() +
+  geom_vline(xintercept = c(1.5, 4.5), color = "white", size = 2) +
+  geom_vline(xintercept = c(3.5, 6.5), color = "white", size = 1) +
+  geom_hline(yintercept = c(3.5, 6.5), color = "white", size = 2) +
+  labs(
+    title = "",
+    x = "",
+    y = "",
+    fill = "Reference to non-reference ratio"
+  ) +
+  theme(
+    axis.text.x = element_text(size = 12),
+    axis.text.y = element_text(size = 12),
+    legend.position = "bottom",
+    legend.key.height = unit(1.2, "cm"),
+    legend.key.width  = unit(2.5, "cm"),
+    legend.title = element_text(size = 14),
+    legend.text  = element_text(size = 12)
+  )
+```
+
+### Prepare silversides methylation plot
+```{r}
+make_mod_plot <- function(mc, ref_set) {
+  
+  # Subset data
+  mc_ref <- subsetByOverlaps(mc, ref_set, ignore.strand = TRUE, type = "any")
+  mc_nonref <- subsetByOverlaps(mc, ref_set, ignore.strand = TRUE, type = "any", invert = TRUE)
+  
+  # Compute modification levels
+  ref_mod <- (getMethylCounts(mc_ref, type="M") +
+              getMethylCounts(mc_ref, type="H")) /
+              getMethylCounts(mc_ref, type="Cov")
+  
+  nonref_mod <- (getMethylCounts(mc_nonref, type="M") +
+                 getMethylCounts(mc_nonref, type="H")) /
+                 getMethylCounts(mc_nonref, type="Cov")
+  
+  # KS test
+  ks_res <- ks.test(ref_mod, nonref_mod)
+  
+  ks_label <- sprintf("KS = %.3f\np = %.1e",
+                      ks_res$statistic,
+                      ks_res$p.value)
+  
+  # Build dataframe
+  mod_df <- data.frame(
+    mod = c(ref_mod, nonref_mod),
+    type = c(rep("reference", length(ref_mod)),
+             rep("non-reference", length(nonref_mod)))
+  )
+  
+  # Summary stats
+  summary_stats <- mod_df %>%
+    group_by(type) %>%
+    summarise(mean_val = mean(mod, na.rm = TRUE), .groups = "drop")
+  
+  # Plot
+  ggplot() +
+    geom_half_violin(
+      data = filter(mod_df, type == "reference"),
+      aes(y = mod, fill = type),
+      adjust = 3,
+      side = "l",
+      position = position_nudge(x = -0.005)
+    ) +
+    geom_half_violin(
+      data = filter(mod_df, type == "non-reference"),
+      aes(y = mod, fill = type),
+      adjust = 3,
+      side = "r",
+      position = position_nudge(x = 0.005)
+    ) +
+    geom_segment(
+      data = filter(summary_stats, type == "reference"),
+      aes(x = -0.3, xend = -0.005, y = mean_val, yend = mean_val),
+      size = 1
+    ) +
+    geom_segment(
+      data = filter(summary_stats, type == "non-reference"),
+      aes(x = 0.005, xend = 0.3, y = mean_val, yend = mean_val),
+      size = 1
+    ) +
+    annotate(
+      "text",
+      x = 0.38,
+      y = min(mod_df$mod, na.rm = TRUE) + 
+          0.05 * (max(mod_df$mod, na.rm = TRUE) - min(mod_df$mod, na.rm = TRUE)),
+      label = ks_label,
+      hjust = 1,
+      vjust = 0,
+      size = 4
+    ) +
+    scale_fill_manual(values = c("reference" = "darkgrey",
+                                 "non-reference" = "lightgrey")) +
+    theme_bw() +
+    theme(
+      axis.title.y = element_blank()
+    )
+}
+```
+
+### Silversides methylation plot
+```{r}
+samples <-c("AA1","AA2","AA3","RA1","RA2", "RA3", "RR1", "RR2", "RR3")
+
+p1 <- make_mod_plot(
+  mc[,1][getCpGs(mc[,1], type = "allCpG"), ],
+  ref_set = ref_CG_gr
+) + labs(x = samples[1])
+
+p2<- make_mod_plot(
+  mc[,2][getCpGs(mc[,2], type = "allCpG"), ],
+  ref_set = ref_CG_gr
+) + labs(x = samples[2])
+
+p3<- make_mod_plot(
+  mc[,3][getCpGs(mc[,3], type = "allCpG"), ],
+  ref_set = ref_CG_gr
+) + labs(x = samples[3])
+
+p4<- make_mod_plot(
+  mc[,4][getCpGs(mc[,4], type = "allCpG"), ],
+  ref_set = ref_CG_gr
+) + labs(x = samples[4])
+
+p5<- make_mod_plot(
+  mc[,5][getCpGs(mc[,5], type = "allCpG"), ],
+  ref_set = ref_CG_gr
+) + labs(x = samples[5])
+
+p6<- make_mod_plot(
+  mc[,6][getCpGs(mc[,6], type = "allCpG"), ],
+  ref_set = ref_CG_gr
+) + labs(x = samples[6])
+
+p7<- make_mod_plot(
+  mc[,7][getCpGs(mc[,7], type = "allCpG"), ],
+  ref_set = ref_CG_gr
+) + labs(x = samples[7])
+
+p8<- make_mod_plot(
+  mc[,8][getCpGs(mc[,8], type = "allCpG"), ],
+  ref_set = ref_CG_gr
+) + labs(x = samples[8])
+
+p9<- make_mod_plot(
+  mc[,9][getCpGs(mc[,9], type = "allCpG"), ],
+  ref_set = ref_CG_gr
+) + labs(x = samples[9])
+```
+
+```{r}
+combined_plot_silver <-c(p7, p8, p9, p4, p5, p6, p1, p2, p3) %>%
+  wrap_plots(nrow = 3) +
+  plot_layout(guides = "collect") &
+  theme(
+    plot.title = element_text(size = 16, face = "bold", hjust = 0.5),
+    axis.text.x = element_text(size = 15),
+    axis.text.y = element_text(size = 15),
+    axis.title.x = element_text(size = 15),
+    legend.position = "bottom",
+    legend.key.size = unit(0.8, "cm"),
+    legend.text = element_text(size = 15),
+    legend.title = element_text(size = 15)
+  )
+combined_plot_silver
+```
+
