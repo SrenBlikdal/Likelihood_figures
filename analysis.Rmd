@@ -1,0 +1,65 @@
+---
+title: "Likelihood figures"
+author: ""
+date: "`r Sys.Date()`"
+output:
+  html_document:
+    toc: true
+    toc_float: true
+    code_folding: show
+    theme: flatly
+---
+
+```{r setup, include=FALSE}
+knitr::opts_chunk$set(
+  echo    = TRUE,
+  message = FALSE,
+  warning = FALSE,
+  fig.width  = 7,
+  fig.height = 5
+)
+```
+
+## Overview
+
+This document reproduces the figures from [link to paper].
+
+---
+
+## Dependencies
+
+```{r packages}
+# Install missing packages with:
+# install.packages(c("tidyverse", "ggplot2"))
+
+library(tidyverse)
+library(ggplot2)
+```
+
+---
+
+## Load data
+
+```{r load-data}
+# Example: dat <- read.csv("data/mydata.csv")
+```
+
+---
+
+## Analysis
+
+Add analysis code here.
+
+---
+
+## Figures
+
+Add figure code here.
+
+---
+
+## Session info
+
+```{r session-info}
+sessionInfo()
+```

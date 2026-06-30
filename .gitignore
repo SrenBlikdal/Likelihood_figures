@@ -1,0 +1,19 @@
+# R / RStudio artifacts
+.Rproj.user/
+.Rhistory
+.RData
+.Ruserdata
+*.Rproj
+
+# Packrat / renv
+packrat/lib*/
+packrat/src/
+renv/library/
+renv/staging/
+
+# knitr cache and figures
+*_cache/
+*_files/
+
+# Optionally ignore the knitted HTML if it is large (uncomment if needed)
+# *.html
